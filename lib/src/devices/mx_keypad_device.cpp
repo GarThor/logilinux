@@ -217,12 +217,26 @@ void MXKeypadDevice::startMonitoring() {
       int bytes_read = read(fd, report.data(), report.size());
 
       if (bytes_read > 0 && bytes_read >= 7) {
+        static uint8_t last_state = 0;
         uint8_t current_state = report[6];
 
         // Grid button detection (1-9 = buttons, 0 = no button)
+        // IMPORTANT: Hardware quirk - when releasing buttons 2-9, the state transitions
+        // through button 1 before reaching 0. Pattern: button_n → 1 → 0
+        // We must ignore transitions TO button 1 unless coming FROM state 0
+        
         if (current_state >= 1 && current_state <= 9) {
-          // Button is pressed - add to set if not already there
           uint8_t button_code = current_state - 1;
+          
+          // Ignore transition to button 1 (state=1) if not from idle (state=0)
+          // This filters out the spurious button 1 events during other button releases
+          if (current_state == 1 && last_state != 0) {
+            // Skip this spurious button 1 event - it's part of another button's release
+            last_state = current_state;
+            continue;
+          }
+          
+          // Real button press - add to set if not already there
           if (impl_->pressed_buttons.find(button_code) == impl_->pressed_buttons.end()) {
             impl_->pressed_buttons.insert(button_code);
             
@@ -253,6 +267,8 @@ void MXKeypadDevice::startMonitoring() {
           }
           impl_->pressed_buttons.clear();
         }
+        
+        last_state = current_state;
       }
       
       // P1/P2 navigation button detection
