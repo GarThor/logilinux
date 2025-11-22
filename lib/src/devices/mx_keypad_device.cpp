@@ -21,6 +21,7 @@ struct MXKeypadDevice::Impl {
   std::atomic<bool> monitoring = false;
   std::thread monitor_thread;
   uint8_t last_button_state = 0;
+  uint8_t last_p_button = 0; // Track last pressed P1/P2 button (0xa1 or 0xa2)
 
   const std::vector<std::vector<uint8_t>> INIT_REPORTS = {
       {0x11, 0xff, 0x0b, 0x3b, 0x01, 0xa1, 0x03, 0x00, 0x00, 0x00,
@@ -235,6 +236,7 @@ void MXKeypadDevice::startMonitoring() {
         
         if (report[4] == 0x01 && (report[5] == 0xa1 || report[5] == 0xa2)) {
           // Button press
+          impl_->last_p_button = report[5]; // Track which button was pressed
           auto event = std::make_shared<ButtonEvent>();
           event->type = EventType::BUTTON_PRESS;
           event->button_code = report[5]; // 0xa1 or 0xa2
@@ -245,9 +247,20 @@ void MXKeypadDevice::startMonitoring() {
           if (event_callback_) {
             event_callback_(event);
           }
-        } else if (report[4] == 0x00) {
-          // Button release (both P1 and P2 release to 00)
-          // We don't track which one was released, but send generic release
+        } else if (report[4] == 0x00 && impl_->last_p_button != 0) {
+          // Button release - emit event for the last pressed P button
+          auto event = std::make_shared<ButtonEvent>();
+          event->type = EventType::BUTTON_RELEASE;
+          event->button_code = impl_->last_p_button; // Use tracked button code
+          event->pressed = false;
+          event->timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+
+          if (event_callback_) {
+            event_callback_(event);
+          }
+          
+          impl_->last_p_button = 0; // Clear tracking
         }
       }
 
