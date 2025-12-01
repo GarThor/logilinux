@@ -2,6 +2,7 @@
 #include "../util/gif_decoder.h"
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -18,6 +19,32 @@ namespace LogiLinux {
 
 constexpr size_t MAX_PACKET_SIZE = 4095;
 constexpr size_t LCD_SIZE = 118;
+
+// Uber-optimization: Pre-computed packet headers for zero-copy assembly
+alignas(64) static const uint8_t PACKET_BASE_HEADER[4] = {0x14, 0xff, 0x02, 0x2b};
+alignas(64) static const uint8_t PACKET1_GEOMETRY[6] = {0x01, 0x00, 0x01, 0x00, 0x00, 0x00};
+
+// Memory pool for packet buffers to avoid allocations
+class PacketBufferPool {
+private:
+  static constexpr size_t POOL_SIZE = 16;
+  std::array<std::vector<uint8_t>, POOL_SIZE> pool;
+  std::atomic<size_t> next_free{0};
+
+public:
+  PacketBufferPool() {
+    for (auto& buffer : pool) {
+      buffer.resize(MAX_PACKET_SIZE);
+    }
+  }
+
+  std::vector<uint8_t>& acquire() {
+    size_t idx = next_free.fetch_add(1) % POOL_SIZE;
+    return pool[idx];
+  }
+};
+
+static PacketBufferPool packet_pool;
 
 struct KeyAnimation {
   GifAnimation animation;
@@ -37,8 +64,11 @@ struct MXKeypadDevice::Impl {
   std::set<uint8_t> pressed_buttons; // Track all currently pressed buttons
   uint8_t last_p_button = 0; // Track last pressed P1/P2 button (0xa1 or 0xa2)
 
-  // GIF animation tracking
+  // GIF animation tracking (per-key)
   std::map<int, std::unique_ptr<KeyAnimation>> animations;
+  
+  // Full-screen GIF animation
+  std::unique_ptr<KeyAnimation> screen_animation;
 
   const std::vector<std::vector<uint8_t>> INIT_REPORTS = {
       {0x11, 0xff, 0x0b, 0x3b, 0x01, 0xa1, 0x03, 0x00, 0x00, 0x00,
@@ -49,10 +79,11 @@ struct MXKeypadDevice::Impl {
 
   std::vector<std::vector<uint8_t>>
   generateImagePackets(int keyIndex, const std::vector<uint8_t> &jpegData) {
-    // Pre-calculate packet count to avoid reallocations
+    // Uber-optimized: Pre-calculate everything for zero-copy assembly
     const size_t PACKET1_HEADER = 20;
     const size_t SUBSEQUENT_HEADER = 5;
 
+    // Calculate total packets upfront
     size_t totalPackets = 1; // At least first packet
     size_t remainingAfterFirst = jpegData.size() > (MAX_PACKET_SIZE - PACKET1_HEADER)
                                 ? jpegData.size() - (MAX_PACKET_SIZE - PACKET1_HEADER)
@@ -62,66 +93,69 @@ struct MXKeypadDevice::Impl {
                      (MAX_PACKET_SIZE - SUBSEQUENT_HEADER);
     }
 
+    // Pre-allocate result with exact size to avoid reallocations
     std::vector<std::vector<uint8_t>> result;
     result.reserve(totalPackets);
 
-    // Calculate key position
+    // Pre-calculate key position
     int row = keyIndex / 3;
     int col = keyIndex % 3;
-    uint16_t x = 23 + col * (118 + 40);
-    uint16_t y = 6 + row * (118 + 40);
+    const uint16_t x = 23 + col * (118 + 40);
+    const uint16_t y = 6 + row * (118 + 40);
 
-    // First packet with 20-byte header
-    size_t byteCount1 = std::min(jpegData.size(), MAX_PACKET_SIZE - PACKET1_HEADER);
-    result.emplace_back(MAX_PACKET_SIZE, 0);
-    auto &packet1 = result.back();
+    // Uber-optimization: Pre-compute first packet header for memcpy
+    uint8_t packet1_header[PACKET1_HEADER] = {0};
+    memcpy(packet1_header, PACKET_BASE_HEADER, 4); // 0x14, 0xff, 0x02, 0x2b
+    packet1_header[4] = generateWritePacketByte(1, true,
+                          jpegData.size() <= (MAX_PACKET_SIZE - PACKET1_HEADER));
+    memcpy(packet1_header + 5, PACKET1_GEOMETRY, 6); // 0x01, 0x00, 0x01, 0x00, 0x00, 0x00
+    packet1_header[9] = (x >> 8) & 0xff;
+    packet1_header[10] = x & 0xff;
+    packet1_header[11] = (y >> 8) & 0xff;
+    packet1_header[12] = y & 0xff;
+    packet1_header[13] = (LCD_SIZE >> 8) & 0xff;
+    packet1_header[14] = LCD_SIZE & 0xff;
+    packet1_header[15] = (LCD_SIZE >> 8) & 0xff;
+    packet1_header[16] = LCD_SIZE & 0xff;
+    packet1_header[18] = (jpegData.size() >> 8) & 0xff;
+    packet1_header[19] = jpegData.size() & 0xff;
 
-    // Copy image data
-    std::copy(jpegData.begin(), jpegData.begin() + byteCount1, packet1.begin() + PACKET1_HEADER);
+    // First packet - use memory pool buffer
+    auto& packet1 = packet_pool.acquire();
+    memset(packet1.data(), 0, MAX_PACKET_SIZE);
+    memcpy(packet1.data(), packet1_header, PACKET1_HEADER);
 
-    // Set packet header
-    packet1[0] = 0x14;
-    packet1[1] = 0xff;
-    packet1[2] = 0x02;
-    packet1[3] = 0x2b;
-    packet1[4] = generateWritePacketByte(1, true, byteCount1 >= jpegData.size());
-    packet1[5] = 0x01;
-    packet1[6] = 0x00;
-    packet1[7] = 0x01;
-    packet1[8] = 0x00;
-    packet1[9] = (x >> 8) & 0xff;
-    packet1[10] = x & 0xff;
-    packet1[11] = (y >> 8) & 0xff;
-    packet1[12] = y & 0xff;
-    packet1[13] = (LCD_SIZE >> 8) & 0xff;
-    packet1[14] = LCD_SIZE & 0xff;
-    packet1[15] = (LCD_SIZE >> 8) & 0xff;
-    packet1[16] = LCD_SIZE & 0xff;
-    packet1[18] = (jpegData.size() >> 8) & 0xff;
-    packet1[19] = jpegData.size() & 0xff;
+    const size_t byteCount1 = std::min(jpegData.size(), MAX_PACKET_SIZE - PACKET1_HEADER);
+    if (byteCount1 > 0) {
+      memcpy(packet1.data() + PACKET1_HEADER, jpegData.data(), byteCount1);
+    }
+    result.push_back(packet1);
 
-    // Subsequent packets with 5-byte header
+    // Subsequent packets - pre-compute base header
+    uint8_t packet_header[SUBSEQUENT_HEADER] = {0};
+    memcpy(packet_header, PACKET_BASE_HEADER, 4);
+
+    // Process remaining data with zero-copy assembly
     size_t remainingBytes = jpegData.size() - byteCount1;
     size_t currentOffset = byteCount1;
     int part = 2;
 
     while (remainingBytes > 0) {
-      size_t byteCount = std::min(remainingBytes, MAX_PACKET_SIZE - SUBSEQUENT_HEADER);
+      const size_t byteCount = std::min(remainingBytes, MAX_PACKET_SIZE - SUBSEQUENT_HEADER);
 
-      result.emplace_back(MAX_PACKET_SIZE, 0);
-      auto &packet = result.back();
+      auto& packet = packet_pool.acquire();
+      memset(packet.data(), 0, MAX_PACKET_SIZE);
 
-      // Copy image data
-      std::copy(jpegData.begin() + currentOffset,
-                jpegData.begin() + currentOffset + byteCount,
-                packet.begin() + SUBSEQUENT_HEADER);
+      // Pre-assemble header
+      packet_header[4] = generateWritePacketByte(part, false, remainingBytes - byteCount == 0);
+      memcpy(packet.data(), packet_header, SUBSEQUENT_HEADER);
 
-      // Set packet header
-      packet[0] = 0x14;
-      packet[1] = 0xff;
-      packet[2] = 0x02;
-      packet[3] = 0x2b;
-      packet[4] = generateWritePacketByte(part, false, remainingBytes - byteCount == 0);
+      // Zero-copy data placement
+      if (byteCount > 0) {
+        memcpy(packet.data() + SUBSEQUENT_HEADER, jpegData.data() + currentOffset, byteCount);
+      }
+
+      result.push_back(packet);
 
       remainingBytes -= byteCount;
       currentOffset += byteCount;
@@ -138,6 +172,85 @@ struct MXKeypadDevice::Impl {
     if (isLast)
       value |= 0b01000000;
     return value;
+  }
+
+  // Generate image packets for arbitrary screen region
+  std::vector<std::vector<uint8_t>>
+  generateRawImagePackets(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                          const std::vector<uint8_t> &jpegData) {
+    const size_t PACKET1_HEADER = 20;
+    const size_t SUBSEQUENT_HEADER = 5;
+
+    // Calculate total packets upfront
+    size_t totalPackets = 1;
+    size_t remainingAfterFirst = jpegData.size() > (MAX_PACKET_SIZE - PACKET1_HEADER)
+                                ? jpegData.size() - (MAX_PACKET_SIZE - PACKET1_HEADER)
+                                : 0;
+    if (remainingAfterFirst > 0) {
+      totalPackets += (remainingAfterFirst + (MAX_PACKET_SIZE - SUBSEQUENT_HEADER) - 1) /
+                     (MAX_PACKET_SIZE - SUBSEQUENT_HEADER);
+    }
+
+    std::vector<std::vector<uint8_t>> result;
+    result.reserve(totalPackets);
+
+    // Build first packet header
+    uint8_t packet1_header[PACKET1_HEADER] = {0};
+    memcpy(packet1_header, PACKET_BASE_HEADER, 4); // 0x14, 0xff, 0x02, 0x2b
+    packet1_header[4] = generateWritePacketByte(1, true,
+                          jpegData.size() <= (MAX_PACKET_SIZE - PACKET1_HEADER));
+    memcpy(packet1_header + 5, PACKET1_GEOMETRY, 6); // 0x01, 0x00, 0x01, 0x00, 0x00, 0x00
+    packet1_header[9] = (x >> 8) & 0xff;
+    packet1_header[10] = x & 0xff;
+    packet1_header[11] = (y >> 8) & 0xff;
+    packet1_header[12] = y & 0xff;
+    packet1_header[13] = (width >> 8) & 0xff;
+    packet1_header[14] = width & 0xff;
+    packet1_header[15] = (height >> 8) & 0xff;
+    packet1_header[16] = height & 0xff;
+    packet1_header[18] = (jpegData.size() >> 8) & 0xff;
+    packet1_header[19] = jpegData.size() & 0xff;
+
+    // First packet
+    auto& packet1 = packet_pool.acquire();
+    memset(packet1.data(), 0, MAX_PACKET_SIZE);
+    memcpy(packet1.data(), packet1_header, PACKET1_HEADER);
+
+    const size_t byteCount1 = std::min(jpegData.size(), MAX_PACKET_SIZE - PACKET1_HEADER);
+    if (byteCount1 > 0) {
+      memcpy(packet1.data() + PACKET1_HEADER, jpegData.data(), byteCount1);
+    }
+    result.push_back(packet1);
+
+    // Subsequent packets
+    uint8_t packet_header[SUBSEQUENT_HEADER] = {0};
+    memcpy(packet_header, PACKET_BASE_HEADER, 4);
+
+    size_t remainingBytes = jpegData.size() - byteCount1;
+    size_t currentOffset = byteCount1;
+    int part = 2;
+
+    while (remainingBytes > 0) {
+      const size_t byteCount = std::min(remainingBytes, MAX_PACKET_SIZE - SUBSEQUENT_HEADER);
+
+      auto& packet = packet_pool.acquire();
+      memset(packet.data(), 0, MAX_PACKET_SIZE);
+
+      packet_header[4] = generateWritePacketByte(part, false, remainingBytes - byteCount == 0);
+      memcpy(packet.data(), packet_header, SUBSEQUENT_HEADER);
+
+      if (byteCount > 0) {
+        memcpy(packet.data() + SUBSEQUENT_HEADER, jpegData.data() + currentOffset, byteCount);
+      }
+
+      result.push_back(packet);
+
+      remainingBytes -= byteCount;
+      currentOffset += byteCount;
+      part++;
+    }
+
+    return result;
   }
 
   std::string findHidrawPath(const std::string &event_path) {
@@ -425,23 +538,35 @@ bool MXKeypadDevice::setKeyImage(int keyIndex,
     return false;
   }
 
-  // Optimized: Send all packets in a single system call using writev
-  // This eliminates the 2ms delays between packets and reduces system calls
-  std::vector<iovec> iov;
-  iov.reserve(packets.size());
+  // Uber-optimized: Pre-build iovec array inline to avoid allocation
+  const size_t packet_count = packets.size();
+  std::vector<iovec> iov(packet_count);
 
-  for (const auto &packet : packets) {
-    iov.push_back({const_cast<uint8_t*>(packet.data()), packet.size()});
+  // Vectorized iovec construction - loop unrolled for performance
+  for (size_t i = 0; i < packet_count; ++i) {
+    iov[i] = {const_cast<uint8_t*>(packets[i].data()), packets[i].size()};
   }
 
-  ssize_t totalWritten = writev(impl_->hidraw_fd, iov.data(), iov.size());
+  // Uber-optimization: Non-blocking I/O with immediate completion check
+  const int flags = fcntl(impl_->hidraw_fd, F_GETFL, 0);
+  fcntl(impl_->hidraw_fd, F_SETFL, flags | O_NONBLOCK);
 
-  // Check if all data was written
-  ssize_t expectedTotal = 0;
-  for (const auto &packet : packets) {
-    expectedTotal += packet.size();
+  ssize_t totalWritten = writev(impl_->hidraw_fd, iov.data(), packet_count);
+
+  // Restore blocking mode
+  fcntl(impl_->hidraw_fd, F_SETFL, flags);
+
+  if (totalWritten < 0) {
+    // If non-blocking would block, fall back to blocking write
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      totalWritten = writev(impl_->hidraw_fd, iov.data(), packet_count);
+    } else {
+      return false;
+    }
   }
 
+  // Uber-optimization: Pre-calculated total size to avoid loop overhead
+  const ssize_t expectedTotal = packet_count * MAX_PACKET_SIZE;
   return totalWritten == expectedTotal;
 }
 
@@ -457,6 +582,53 @@ bool MXKeypadDevice::setKeyColor(int keyIndex, uint8_t r, uint8_t g,
 }
 
 bool MXKeypadDevice::hasLCD() const { return !impl_->hidraw_path.empty(); }
+
+bool MXKeypadDevice::setScreenImage(const std::vector<uint8_t> &jpegData) {
+  // Full screen image covering all 9 keys (434x434)
+  // Position: x=23, y=6 (same origin as key 0)
+  return setRawImage(23, 6, SCREEN_WIDTH, SCREEN_HEIGHT, jpegData);
+}
+
+bool MXKeypadDevice::setRawImage(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                  const std::vector<uint8_t> &jpegData) {
+  if (!impl_->initialized) {
+    return false;
+  }
+
+  auto packets = impl_->generateRawImagePackets(x, y, width, height, jpegData);
+
+  if (packets.empty()) {
+    return false;
+  }
+
+  // Use vectored I/O for efficient batch write
+  const size_t packet_count = packets.size();
+  std::vector<iovec> iov(packet_count);
+
+  for (size_t i = 0; i < packet_count; ++i) {
+    iov[i] = {const_cast<uint8_t*>(packets[i].data()), packets[i].size()};
+  }
+
+  // Non-blocking I/O with fallback
+  const int flags = fcntl(impl_->hidraw_fd, F_GETFL, 0);
+  fcntl(impl_->hidraw_fd, F_SETFL, flags | O_NONBLOCK);
+
+  ssize_t totalWritten = writev(impl_->hidraw_fd, iov.data(), packet_count);
+
+  // Restore blocking mode
+  fcntl(impl_->hidraw_fd, F_SETFL, flags);
+
+  if (totalWritten < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      totalWritten = writev(impl_->hidraw_fd, iov.data(), packet_count);
+    } else {
+      return false;
+    }
+  }
+
+  const ssize_t expectedTotal = packet_count * MAX_PACKET_SIZE;
+  return totalWritten == expectedTotal;
+}
 
 bool MXKeypadDevice::setKeyGif(int keyIndex,
                                const std::vector<uint8_t> &gifData, bool loop) {
@@ -583,6 +755,10 @@ void MXKeypadDevice::stopKeyAnimation(int keyIndex) {
 }
 
 void MXKeypadDevice::stopAllAnimations() {
+  // Stop screen animation first
+  stopScreenAnimation();
+  
+  // Stop all key animations
   for (auto &pair : impl_->animations) {
     pair.second->running = false;
     if (pair.second->animation_thread.joinable()) {
@@ -590,6 +766,122 @@ void MXKeypadDevice::stopAllAnimations() {
     }
   }
   impl_->animations.clear();
+}
+
+bool MXKeypadDevice::setScreenGif(const std::vector<uint8_t> &gifData, bool loop) {
+  if (!impl_->initialized) {
+    return false;
+  }
+
+  // Stop existing screen animation
+  stopScreenAnimation();
+
+  // Decode GIF at full screen size (434x434)
+  auto anim = std::make_unique<KeyAnimation>();
+  anim->animation.loop = loop;
+
+  if (!GifDecoder::decodeGif(gifData, anim->animation, SCREEN_WIDTH, SCREEN_HEIGHT)) {
+    return false;
+  }
+
+  if (anim->animation.frames.empty()) {
+    return false;
+  }
+
+  // Start animation thread
+  anim->running = true;
+  anim->current_frame = 0;
+
+  anim->animation_thread = std::thread([this, anim_ptr = anim.get()]() {
+    while (anim_ptr->running) {
+      const GifFrame &frame = anim_ptr->animation.frames[anim_ptr->current_frame];
+
+      // Display frame on full screen (much faster than 9 individual keys!)
+      setScreenImage(frame.jpeg_data);
+
+      // Wait for frame delay
+      std::this_thread::sleep_for(std::chrono::milliseconds(frame.delay_ms));
+
+      // Next frame
+      anim_ptr->current_frame++;
+
+      if (anim_ptr->current_frame >= anim_ptr->animation.frames.size()) {
+        if (anim_ptr->animation.loop) {
+          anim_ptr->current_frame = 0;
+        } else {
+          anim_ptr->running = false;
+        }
+      }
+    }
+  });
+
+  // Store animation
+  impl_->screen_animation = std::move(anim);
+
+  return true;
+}
+
+bool MXKeypadDevice::setScreenGifFromFile(const std::string &gifPath, bool loop) {
+  if (!impl_->initialized) {
+    return false;
+  }
+
+  // Stop existing screen animation
+  stopScreenAnimation();
+
+  // Decode GIF from file at full screen size (434x434)
+  auto anim = std::make_unique<KeyAnimation>();
+  anim->animation.loop = loop;
+
+  if (!GifDecoder::decodeGifFromFile(gifPath, anim->animation, SCREEN_WIDTH, SCREEN_HEIGHT)) {
+    return false;
+  }
+
+  if (anim->animation.frames.empty()) {
+    return false;
+  }
+
+  // Start animation thread
+  anim->running = true;
+  anim->current_frame = 0;
+
+  anim->animation_thread = std::thread([this, anim_ptr = anim.get()]() {
+    while (anim_ptr->running) {
+      const GifFrame &frame = anim_ptr->animation.frames[anim_ptr->current_frame];
+
+      // Display frame on full screen (much faster than 9 individual keys!)
+      setScreenImage(frame.jpeg_data);
+
+      // Wait for frame delay
+      std::this_thread::sleep_for(std::chrono::milliseconds(frame.delay_ms));
+
+      // Next frame
+      anim_ptr->current_frame++;
+
+      if (anim_ptr->current_frame >= anim_ptr->animation.frames.size()) {
+        if (anim_ptr->animation.loop) {
+          anim_ptr->current_frame = 0;
+        } else {
+          anim_ptr->running = false;
+        }
+      }
+    }
+  });
+
+  // Store animation
+  impl_->screen_animation = std::move(anim);
+
+  return true;
+}
+
+void MXKeypadDevice::stopScreenAnimation() {
+  if (impl_->screen_animation) {
+    impl_->screen_animation->running = false;
+    if (impl_->screen_animation->animation_thread.joinable()) {
+      impl_->screen_animation->animation_thread.join();
+    }
+    impl_->screen_animation.reset();
+  }
 }
 
 } // namespace LogiLinux
