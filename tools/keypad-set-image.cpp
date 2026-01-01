@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --device requires an argument" << std::endl;
                 return 1;
             }
-        } else if (buttonArg.empty()) {
+        } else if (buttonArg.empty() && !setAll) {
             buttonArg = arg;
         } else if (imagePath.empty()) {
             imagePath = arg;
@@ -130,12 +130,17 @@ int main(int argc, char* argv[]) {
     }
     
     // Validate arguments
-    if (buttonArg.empty() || imagePath.empty()) {
-        std::cerr << "Error: Missing required arguments" << std::endl;
+    if (buttonArg.empty() && !setAll) {
+        std::cerr << "Error: Missing required argument: button index" << std::endl;
         std::cerr << "Use --help for usage information." << std::endl;
         return 1;
     }
-    
+    else if (imagePath.empty()) {
+        std::cerr << "Error: Missing required argument: image path" << std::endl;
+        std::cerr << "Use --help for usage information." << std::endl;
+        return 1;
+    }
+
     int buttonIndex = parseButtonIndex(buttonArg);
     if (!setAll && buttonIndex < 0) {
         std::cerr << "Error: Invalid button index: " << buttonArg << std::endl;
