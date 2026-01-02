@@ -216,7 +216,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --device requires an argument" << std::endl;
                 return 1;
             }
-        } else if (buttonArg.empty()) {
+        } else if (buttonArg.empty() && !setAll) {
             buttonArg = arg;
         } else if (colorArg.empty()) {
             colorArg = arg;
@@ -226,8 +226,13 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (buttonArg.empty() || colorArg.empty()) {
-        std::cerr << "Error: Missing required arguments" << std::endl;
+    if (buttonArg.empty() && !setAll) {
+        std::cerr << "Error: Missing required argument: button index" << std::endl;
+        std::cerr << "Use --help for usage information." << std::endl;
+        return 1;
+    }
+    else if (colorArg.empty()) {
+        std::cerr << "Error: Missing required argument: color index" << std::endl;
         std::cerr << "Use --help for usage information." << std::endl;
         return 1;
     }
