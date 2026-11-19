@@ -13,8 +13,16 @@ set(LOGILINUX_SOURCES
 # Create shared library
 add_library(logilinux SHARED ${LOGILINUX_SOURCES})
 
-# Set C++17 standard
-target_compile_features(logilinux PUBLIC cxx_std_17)
+# Set C++23 standard
+target_compile_features(logilinux PUBLIC cxx_std_23)
+
+if (MSVC)
+    # warning level 4
+    add_compile_options(/W4)
+else()
+    # additional warnings
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
 # Include directories
 target_include_directories(logilinux
